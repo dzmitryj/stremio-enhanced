@@ -117,7 +117,7 @@ export const SERVER_JS_URL = "https://dl.strem.io/server/v4.20.17/desktop/server
 // FFmpeg Download URLs
 export const FFMPEG_URLS = {
     win32: {
-        x64: "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip",
+        x64: "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip",
         arm64: "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-winarm64-gpl.zip",
     },
     darwin: {

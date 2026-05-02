@@ -96,39 +96,98 @@ class StreamingServer {
 
     private static async downloadFile(url: string, dest: string): Promise<void> {
         return new Promise((resolve, reject) => {
-            const file = createWriteStream(dest);
+            const MAX_REDIRECTS = 5;
+            let redirectCount = 0;
 
-            const request = (downloadUrl: string) => {
-                https.get(downloadUrl, { headers: { "User-Agent": "Stremio-Enhanced" } }, (res) => {
-                    // Handle redirects (GitHub releases use redirects)
+            const makeRequest = (downloadUrl: string) => {
+                if (redirectCount >= MAX_REDIRECTS) {
+                    reject(new Error(`Too many redirects downloading ${url}`));
+                    return;
+                }
+                redirectCount++;
+
+                const file = createWriteStream(dest);
+                let downloadedSize = 0;
+                let expectedSize = 0;
+
+                https.get(downloadUrl, {
+                    headers: {
+                        "User-Agent": "Stremio-Enhanced",
+                        "Accept": "application/octet-stream,application/zip,application/x-gzip,*/*"
+                    }
+                }, (res) => {
+                    // Handle redirects
                     if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+                        file.close();
                         const redirectUrl = new URL(res.headers.location, downloadUrl).toString();
                         this.logger.info(`Following redirect to: ${redirectUrl}`);
-                        request(redirectUrl);
+                        makeRequest(redirectUrl);
                         return;
                     }
 
                     if (res.statusCode !== 200) {
                         file.close();
+                        try { unlinkSync(dest); } catch {}
                         reject(new Error(`Failed to download ${url}: HTTP ${res.statusCode}`));
                         return;
                     }
 
-                    res.pipe(file);
-                    file.on("finish", () => {
-                        file.close(() => resolve());
+                    // Validate content type - reject HTML error pages
+                    const contentType = res.headers["content-type"] || "";
+                    if (contentType.includes("text/html")) {
+                        file.close();
+                        try { unlinkSync(dest); } catch {}
+                        reject(new Error(`Download returned HTML page instead of binary file. The download URL may be invalid or the file may no longer be available.`));
+                        return;
+                    }
+
+                    // Track expected size
+                    if (res.headers["content-length"]) {
+                        expectedSize = parseInt(res.headers["content-length"], 10);
+                        this.logger.info(`Expected download size: ${expectedSize} bytes (${(expectedSize / 1024 / 1024).toFixed(1)} MB)`);
+                    }
+
+                    res.on("data", (chunk) => {
+                        downloadedSize += chunk.length;
                     });
+
+                    res.pipe(file);
+
+                    file.on("finish", () => {
+                        file.close(() => {
+                            // Validate downloaded size matches expected
+                            if (expectedSize > 0 && downloadedSize !== expectedSize) {
+                                try { unlinkSync(dest); } catch {}
+                                reject(new Error(`Download incomplete: expected ${expectedSize} bytes but got ${downloadedSize} bytes`));
+                                return;
+                            }
+
+                            // Validate minimum size (ffmpeg should be at least 10MB)
+                            const MIN_SIZE = 10 * 1024 * 1024; // 10MB
+                            if (downloadedSize < MIN_SIZE) {
+                                try { unlinkSync(dest); } catch {}
+                                reject(new Error(`Downloaded file is too small (${downloadedSize} bytes). Expected at least ${MIN_SIZE} bytes. The file may be corrupted or an error page.`));
+                                return;
+                            }
+
+                            this.logger.info(`Download complete: ${downloadedSize} bytes (${(downloadedSize / 1024 / 1024).toFixed(1)} MB)`);
+                            resolve();
+                        });
+                    });
+
                     res.on("error", (err) => {
                         file.close();
+                        try { unlinkSync(dest); } catch {}
                         reject(err);
                     });
                 }).on("error", (err) => {
                     file.close();
+                    try { unlinkSync(dest); } catch {}
                     reject(err);
                 });
             };
 
-            request(url);
+            makeRequest(url);
         });
     }
 
@@ -194,11 +253,31 @@ class StreamingServer {
                 // Extract the whole archive first
                 execSync(`powershell -Command "Expand-Archive -Path '${archivePath}' -DestinationPath '${this.streamingServerDir}' -Force"`, { encoding: "utf8" });
                 
+                // Find the extracted directory dynamically (gyan.dev uses versioned folder names like "ffmpeg-7.1-essentials_build")
+                // Sort by creation time to get the most recently extracted directory first
+                const extractedItems = execSync(
+                    `powershell -Command "Get-ChildItem -Path '${this.streamingServerDir}' -Directory | Sort-Object CreationTime -Descending | Select-Object -ExpandProperty Name"`,
+                    { encoding: "utf8" }
+                ).trim().split("\n").map(s => s.trim()).filter(s => s);
+                
+                // Find the ffmpeg build directory (should contain a 'bin' folder)
+                const ffmpegDir = extractedItems.find(dir => {
+                    const binPath = join(this.streamingServerDir, dir, "bin");
+                    return existsSync(binPath);
+                });
+                
+                if (!ffmpegDir) {
+                    throw new Error("Could not find ffmpeg build directory in extracted archive. Expected a folder containing a 'bin' subdirectory.");
+                }
+                
+                this.logger.info(`Found ffmpeg build directory: ${ffmpegDir}`);
+                
                 // Move bin folder contents to the streamingserver directory
-                execSync(`powershell -Command "Move-Item -Path '${this.streamingServerDir}\\ffmpeg-master-latest-win64-gpl\\bin\\*' -Destination '${this.streamingServerDir}' -Force"`, { encoding: "utf8" });
+                const binPath = join(this.streamingServerDir, ffmpegDir, "bin");
+                execSync(`powershell -Command "Move-Item -Path '${binPath}\\*' -Destination '${this.streamingServerDir}' -Force"`, { encoding: "utf8" });
                 
                 // Cleanup: remove extracted directory
-                execSync(`powershell -Command "Remove-Item -Recurse -Force '${this.streamingServerDir}\\ffmpeg-master-latest-win64-gpl'"`, { encoding: "utf8" });
+                execSync(`powershell -Command "Remove-Item -Recurse -Force '${join(this.streamingServerDir, ffmpegDir)}'"`, { encoding: "utf8" });
 
                 unlinkSync(archivePath);
                 return true;
