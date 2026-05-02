@@ -14,12 +14,44 @@ class StremioService {
     private static logger = getLogger("StremioService");
     private static execFileAsync = promisify(execFile);
 
+    private static async getWorkingBinaryPath(binary: "ffmpeg" | "ffprobe"): Promise<string | null> {
+        if (process.platform !== "win32") return null;
+
+        const localAppData = process.env.LOCALAPPDATA || join(homedir(), "AppData", "Local");
+        const candidates = [
+            join(localAppData, "Programs", "StremioService", `${binary}.exe`),
+            join(localAppData, "Programs", "Stremio", `${binary}.exe`),
+        ];
+
+        for (const candidate of candidates) {
+            if (!existsSync(candidate)) continue;
+
+            try {
+                await this.execFileAsync(candidate, ["-version"], { windowsHide: true });
+                if (!candidate.includes("StremioService")) {
+                    this.logger.warn(`Using ${binary} from Stremio install because Stremio Service ${binary} is not usable: ${candidate}`);
+                }
+                return candidate;
+            } catch (error) {
+                this.logger.error(`${binary} failed to start at ${candidate}: ${(error as Error).message}`);
+            }
+        }
+
+        return null;
+    }
+
     public static start(): Promise<void> {
-        return new Promise((resolve, reject) => {
+        return new Promise(async (resolve, reject) => {
             try {
                 this.logger.info("Starting Stremio Service...");
 
                 let child;
+                const env = { ...process.env };
+
+                const ffmpegPath = await this.getWorkingBinaryPath("ffmpeg");
+                const ffprobePath = await this.getWorkingBinaryPath("ffprobe");
+                if (ffmpegPath) env.FFMPEG_BIN = ffmpegPath;
+                if (ffprobePath) env.FFPROBE_BIN = ffprobePath;
 
                 switch (process.platform) {
                     case "win32": 
@@ -27,13 +59,13 @@ class StremioService {
                         if (!exe) {
                             return reject(new Error("Could not find Stremio Service executable"));
                         }
-                        child = spawn(exe, [], { detached: true, stdio: "ignore" });
+                        child = spawn(exe, [], { detached: true, stdio: "ignore", env });
                         break;
                     case "darwin": 
-                        child = spawn("open", ["/Applications/StremioService.app"], { detached: true, stdio: "ignore" });
+                        child = spawn("open", ["/Applications/StremioService.app"], { detached: true, stdio: "ignore", env });
                         break;
                     case "linux": 
-                        child = spawn("flatpak", ["run", "com.stremio.Service"], { detached: true, stdio: "ignore" });
+                        child = spawn("flatpak", ["run", "com.stremio.Service"], { detached: true, stdio: "ignore", env });
                         break;
                     default:
                         return reject(new Error("Unsupported platform"));
@@ -202,8 +234,9 @@ class StremioService {
 
         if (platform === "win32") {
             return new Promise(resolve => {
-                execFile("tasklist", ["/FI", 'IMAGENAME eq stremio-service.exe'], (_err, stdout) => {
-                    resolve(Boolean(stdout && stdout.includes("stremio-service.exe")));
+                execFile("tasklist", (_err, stdout) => {
+                    const output = stdout.toLowerCase();
+                    resolve(output.includes("stremio-service.exe") || output.includes("stremio-runtime.exe"));
                 });
             });
         }
@@ -245,6 +278,34 @@ class StremioService {
                 }
             default:
                 return false;
+        }
+    }
+
+    public static async hasWorkingFFprobe(): Promise<boolean> {
+        if (process.platform !== "win32") return true;
+        return Boolean(await this.getWorkingBinaryPath("ffprobe"));
+    }
+
+    public static async needsRestartWithFallbackBinaries(): Promise<boolean> {
+        if (process.platform !== "win32") return false;
+
+        const localAppData = process.env.LOCALAPPDATA || join(homedir(), "AppData", "Local");
+        const serviceFFmpeg = join(localAppData, "Programs", "StremioService", "ffmpeg.exe");
+        const serviceFFprobe = join(localAppData, "Programs", "StremioService", "ffprobe.exe");
+
+        const serviceFFmpegWorks = await this.canStartBinary(serviceFFmpeg);
+        const serviceFFprobeWorks = await this.canStartBinary(serviceFFprobe);
+        return !serviceFFmpegWorks || !serviceFFprobeWorks;
+    }
+
+    private static async canStartBinary(path: string): Promise<boolean> {
+        if (!existsSync(path)) return false;
+
+        try {
+            await this.execFileAsync(path, ["-version"], { windowsHide: true });
+            return true;
+        } catch {
+            return false;
         }
     }
 
@@ -380,12 +441,12 @@ class StremioService {
     private static getPidForWindows(): number | null {
         const execSync = require('child_process').execSync;
         try {
-            const output = execSync('tasklist /FI "IMAGENAME eq stremio-service.exe"').toString();
+            const output = execSync('tasklist').toString();
             
             const lines = output.split('\n');
             
             for (const line of lines) {
-                if (line.includes('stremio-service.exe')) {
+                if (line.includes('stremio-service.exe') || line.includes('stremio-runtime.exe')) {
                     const columns = line.trim().split(/\s+/);
                     if (columns.length > 1) {
                         return parseInt(columns[1], 10);
@@ -393,7 +454,7 @@ class StremioService {
                 }
             }
             
-            this.logger.error("Stremio service not found in tasklist.");
+            this.logger.error("Stremio service/runtime not found in tasklist.");
         } catch (error) {
             this.logger.error('Error retrieving PID for Stremio service on Windows:' + error);
         }
@@ -443,8 +504,9 @@ class StremioService {
             switch (process.platform) {
 
                 case "win32": 
-                    const { stdout } = await this.execFileAsync("tasklist", ["/FI", 'IMAGENAME eq stremio-service.exe']);
-                    return stdout.toLowerCase().includes("stremio-service.exe");
+                    const { stdout } = await this.execFileAsync("tasklist");
+                    const output = stdout.toLowerCase();
+                    return output.includes("stremio-service.exe") || output.includes("stremio-runtime.exe");
                 case "darwin":
                 case "linux": 
                     try {

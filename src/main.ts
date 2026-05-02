@@ -1,9 +1,9 @@
 import { join } from "path";
-import { mkdirSync, existsSync, writeFileSync } from "fs";
+import { mkdirSync, existsSync, writeFileSync, unlinkSync } from "fs";
 import Updater from "./core/Updater";
 import Properties from "./core/Properties";
 import logger from "./utils/logger";
-import { IPC_CHANNELS, URLS, SERVER_JS_URL } from "./constants";
+import { IPC_CHANNELS, URLS } from "./constants";
 
 // Fix GTK 2/3 and GTK 4 conflict on Linux
 import { app } from 'electron';
@@ -120,7 +120,27 @@ async function createWindow() {
 // Use Stremio Service for streaming
 async function useStremioService() {
     if(await StremioService.isServiceInstalled()) {
-        logger.info("Found installation of Stremio Service.");
+        if (!await StremioService.hasWorkingFFprobe()) {
+            const result = await Helpers.showAlert(
+                "error",
+                "Stremio Service is broken",
+                "Stremio Service is installed, but its ffprobe.exe cannot start. This makes /hlsv2/probe fail for every stream. Reinstall Stremio Service, or use server.js directly.",
+                ["Reinstall Stremio Service", "Use server.js"]
+            );
+
+            if (result === 0) {
+                StremioService.terminate();
+                await StremioService.downloadAndInstallService();
+            } else {
+                StremioService.terminate();
+                if (existsSync(useStremioServiceFlagPath)) unlinkSync(useStremioServiceFlagPath);
+                writeFileSync(useServerJSFlagPath, "1");
+                await useServerJS();
+            }
+            return;
+        }
+
+        logger.info("Found usable installation of Stremio Service.");
         await StremioService.start();
     } else {
         const result = await Helpers.showAlert(
@@ -184,7 +204,17 @@ app.on("ready", async () => {
             }
         } else {
             logger.info("Stremio Service is already running.");
-            Properties.isUsingStremioService = true;
+            if (await StremioService.needsRestartWithFallbackBinaries()) {
+                logger.warn("Restarting Stremio Service to use working FFmpeg/FFprobe binaries.");
+                StremioService.terminate();
+                await useStremioService();
+            } else if (await StremioService.hasWorkingFFprobe()) {
+                Properties.isUsingStremioService = true;
+            } else {
+                logger.error("Running Stremio Service has a broken ffprobe installation.");
+                StremioService.terminate();
+                await useStremioService();
+            }
         }
     } else logger.info("Launching without Stremio streaming server.");
     
@@ -243,7 +273,6 @@ async function chooseStreamingServer() {
 }
 
 async function useServerJS() {
-    // First, try to ensure streaming server files are available
     logger.info("Checking for streaming server files...");
     const filesStatus = await StreamingServer.ensureStreamingServerFiles();
     
@@ -251,61 +280,11 @@ async function useServerJS() {
         logger.info("Running server.js directly...");
         StreamingServer.start();
     } else if(filesStatus === "missing_server_js") {
-        // server.js is missing - show instructions to the user in a loop
-        logger.info("server.js not found. Showing download instructions to user...");
-        const serverDir = StreamingServer.getStreamingServerDir();
-        const downloadUrl = SERVER_JS_URL;
-        
-        let serverJsFound = false;
-        while (!serverJsFound) {
-            const result = await Helpers.showAlert(
-                "info",
-                "Streaming Server Setup Required",
-                `To enable video playback, you need to download the Stremio streaming server file (server.js).\n\n` +
-                `1. Download server.js from:\n${downloadUrl}\n\n` +
-                `2. Right click the page and select "Save As" and save it as "server.js".\n\n` +
-                `3. Place it in:\n${serverDir}\n\n` +
-                `Click "Open Folder" to open the destination folder, or "Download" to open the download link in your browser. Click "Close" when you have placed the file in the correct location and FFmpeg will be downloaded automatically if needed.`,
-                ["Open Folder", "Download", "Close"]
-            );
-            
-            if (result === 0) {
-                // Open the folder
-                StreamingServer.openStreamingServerDir();
-            } else if (result === 1) {
-                // Open the download URL in browser
-                shell.openExternal(downloadUrl);
-            } else {
-                // User clicked Close - check if file exists now
-                if (StreamingServer.serverJsExists()) {
-                    serverJsFound = true;
-                    logger.info("server.js found after user action. Proceeding with streaming server setup...");
-                    // Re-run the setup to also check/download ffmpeg
-                    const retryStatus = await StreamingServer.ensureStreamingServerFiles();
-                    if (retryStatus === "ready") {
-                        logger.info("Launching local streaming server.");
-                        await Helpers.showAlert("info", "Streaming Server Setup Complete", "The streaming server has been set up successfully and will now start. You may need to reload the streaming server from the settings.", ["OK"]);
-                        StreamingServer.start();
-                    } else {
-                        // FFmpeg issue - fall back to Stremio Service
-                        logger.info("FFmpeg not available after server.js setup. Falling back to Stremio Service...");
-                        await Helpers.showAlert("error", "Failed to download FFmpeg", "Failed to automatically download FFmpeg. FFmpeg is required for the streaming server to function properly. The app will now use Stremio Service for streaming instead for this instance.", ["OK"]);
-                        await useStremioService();
-                    }
-                } else {
-                    // File still not there - warn and show dialog again
-                    await Helpers.showAlert(
-                        "warning",
-                        "File Not Found",
-                        `server.js was not found in:\n${serverDir}\n\nPlease download the file and place it in the correct location.`,
-                        ["OK"]
-                    );
-                }
-            }
-        }
+        logger.error("server.js could not be prepared.");
+        await Helpers.showAlert("error", "Streaming Server Setup Failed", "Could not download or prepare server.js. The app will fall back to Stremio Service for this session.", ["OK"]);
+        await useStremioService();
     } else {
-        // FFmpeg download failed - fall back to Stremio Service
-        logger.info("FFmpeg not available. Falling back to Stremio Service...");
+        logger.info("Working FFmpeg/FFprobe binaries are not available. Falling back to Stremio Service...");
         await useStremioService();
     }
 }

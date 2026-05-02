@@ -1,11 +1,11 @@
-import { fork, execSync } from "child_process";
+import { fork, execFileSync, execSync } from "child_process";
 import { createWriteStream, existsSync, mkdirSync, chmodSync, unlinkSync } from "fs";
 import { join } from "path";
 import { getLogger } from "./logger";
 import Properties from "../core/Properties";
 import https from "https";
 import { shell } from "electron";
-import { FFMPEG_URLS, MACOS_FFPROBE_URLS } from "../constants";
+import { FFMPEG_URLS, MACOS_FFPROBE_URLS, SERVER_JS_URL } from "../constants";
 
 class StreamingServer {
     private static logger = getLogger("StreamingServer");
@@ -49,49 +49,68 @@ class StreamingServer {
         shell.openPath(this.streamingServerDir);
     }
 
-    // Check if system ffmpeg/ffprobe are available and working
-    private static getSystemBinaryPath(binary: string): string | null {
+    private static isWorkingBinary(path: string): boolean {
+        if (!existsSync(path)) return false;
+
         try {
-            const result = execSync(`which ${binary}`, { encoding: "utf8", stdio: ["pipe", "pipe", "pipe"] });
-            const path = result.trim();
-            if (path && existsSync(path)) {
-                this.logger.info(`Found system ${binary} at: ${path}`);
-                return path;
+            execFileSync(path, ["-version"], { stdio: "ignore" });
+            return true;
+        } catch {
+            return false;
+        }
+    }
+
+    private static getSystemBinaryPath(binary: "ffmpeg" | "ffprobe"): string | null {
+        const command = process.platform === "win32" ? "where" : "which";
+
+        try {
+            const result = execSync(`${command} ${binary}`, { encoding: "utf8", stdio: ["pipe", "pipe", "ignore"] });
+            for (const path of result.split(/\r?\n/).map(line => line.trim()).filter(Boolean)) {
+                if (this.isWorkingBinary(path)) {
+                    this.logger.info(`Using system ${binary}: ${path}`);
+                    return path;
+                }
             }
         } catch {
-            // which command failed, binary not found
+            // Binary is not on PATH.
         }
+
         return null;
     }
 
-    // Get the best available ffmpeg path (prefer system, fallback to downloaded)
-    private static getFFmpegPath(): string {
-        // First, try system ffmpeg
-        const systemFFmpeg = this.getSystemBinaryPath("ffmpeg");
-        if (systemFFmpeg) {
-            return systemFFmpeg;
+    private static getStremioInstallBinaryPath(binary: "ffmpeg" | "ffprobe"): string | null {
+        if (process.platform !== "win32") return null;
+
+        const localAppData = process.env.LOCALAPPDATA;
+        if (!localAppData) return null;
+
+        const path = join(localAppData, "Programs", "Stremio", `${binary}.exe`);
+        if (this.isWorkingBinary(path)) {
+            this.logger.info(`Using ${binary} from Stremio install: ${path}`);
+            return path;
         }
 
-        // Fall back to downloaded version
-        const downloadedPath = process.platform == "win32"
-            ? join(this.streamingServerDir, "ffmpeg.exe")
-            : join(this.streamingServerDir, "ffmpeg");
-        return downloadedPath;
+        return null;
     }
 
-    // Get the best available ffprobe path (prefer system, fallback to downloaded)
-    private static getFFprobePath(): string {
-        // First, try system ffprobe
-        const systemFFprobe = this.getSystemBinaryPath("ffprobe");
-        if (systemFFprobe) {
-            return systemFFprobe;
-        }
+    private static getDownloadedBinaryPath(binary: "ffmpeg" | "ffprobe"): string {
+        return process.platform === "win32"
+            ? join(this.streamingServerDir, `${binary}.exe`)
+            : join(this.streamingServerDir, binary);
+    }
 
-        // Fall back to downloaded version
-        const downloadedPath = process.platform == "win32"
-            ? join(this.streamingServerDir, "ffprobe.exe")
-            : join(this.streamingServerDir, "ffprobe");
-        return downloadedPath;
+    private static findWorkingBinary(binary: "ffmpeg" | "ffprobe"): string | null {
+        return this.getSystemBinaryPath(binary)
+            ?? this.getStremioInstallBinaryPath(binary)
+            ?? (this.isWorkingBinary(this.getDownloadedBinaryPath(binary)) ? this.getDownloadedBinaryPath(binary) : null);
+    }
+
+    private static getFFmpegPath(): string {
+        return this.findWorkingBinary("ffmpeg") ?? this.getDownloadedBinaryPath("ffmpeg");
+    }
+
+    private static getFFprobePath(): string {
+        return this.findWorkingBinary("ffprobe") ?? this.getDownloadedBinaryPath("ffprobe");
     }
 
     private static async downloadFile(url: string, dest: string): Promise<void> {
@@ -130,6 +149,23 @@ class StreamingServer {
 
             request(url);
         });
+    }
+
+    private static async ensureServerJS(): Promise<boolean> {
+        if (existsSync(this.serverScriptPath)) return true;
+
+        try {
+            this.logger.info(`Downloading server.js from ${SERVER_JS_URL}...`);
+            await this.downloadFile(SERVER_JS_URL, this.serverScriptPath);
+            this.logger.info(`server.js downloaded to: ${this.serverScriptPath}`);
+            return true;
+        } catch (error) {
+            this.logger.error(`Failed to download server.js: ${error}`);
+            if (existsSync(this.serverScriptPath)) {
+                try { unlinkSync(this.serverScriptPath); } catch {}
+            }
+            return false;
+        }
     }
 
     private static async downloadAndExtractFFmpeg(): Promise<boolean> {
@@ -190,15 +226,10 @@ class StreamingServer {
                 unlinkSync(ffprobeArchivePath);
                 return true;
             } else if (process.platform === "win32") {
-                // Handle Windows zip file
-                // Extract the whole archive first
                 execSync(`powershell -Command "Expand-Archive -Path '${archivePath}' -DestinationPath '${this.streamingServerDir}' -Force"`, { encoding: "utf8" });
-                
-                // Move bin folder contents to the streamingserver directory
-                execSync(`powershell -Command "Move-Item -Path '${this.streamingServerDir}\\ffmpeg-master-latest-win64-gpl\\bin\\*' -Destination '${this.streamingServerDir}' -Force"`, { encoding: "utf8" });
-                
-                // Cleanup: remove extracted directory
-                execSync(`powershell -Command "Remove-Item -Recurse -Force '${this.streamingServerDir}\\ffmpeg-master-latest-win64-gpl'"`, { encoding: "utf8" });
+
+                const ps = `$dir = Get-ChildItem -Path '${this.streamingServerDir}' -Directory | Where-Object { $_.Name -like 'ffmpeg-*' } | Select-Object -First 1; if (-not $dir) { throw 'FFmpeg archive did not contain an ffmpeg-* directory' }; Move-Item -Path (Join-Path $dir.FullName 'bin\\*') -Destination '${this.streamingServerDir}' -Force; Remove-Item -Recurse -Force $dir.FullName`;
+                execSync(`powershell -Command "${ps}"`, { encoding: "utf8" });
 
                 unlinkSync(archivePath);
                 return true;
@@ -223,35 +254,16 @@ class StreamingServer {
                 mkdirSync(this.streamingServerDir, { recursive: true });
             }
 
-            // Check if server.js exists (user must download manually)
-            if (!existsSync(this.serverScriptPath)) {
-                this.logger.warn("server.js not found. User needs to download it manually.");
+            if (!await this.ensureServerJS()) {
                 return "missing_server_js";
             }
 
-            // Check if we need to download ffmpeg/ffprobe
-            // Only download if system versions are not available
-            const systemFFmpeg = this.getSystemBinaryPath("ffmpeg");
-            const systemFFprobe = this.getSystemBinaryPath("ffprobe");
-
-            if (systemFFmpeg && systemFFprobe) {
-                this.logger.info("Using system ffmpeg and ffprobe.");
-            } else {
-                // Need to download ffmpeg binaries
-                const downloadedFFmpeg = process.platform == "win32"
-                    ? join(this.streamingServerDir, "ffmpeg.exe")
-                    : join(this.streamingServerDir, "ffmpeg");
-                const downloadedFFprobe = process.platform == "win32"
-                    ? join(this.streamingServerDir, "ffprobe.exe")
-                    : join(this.streamingServerDir, "ffprobe");
-
-                if (!existsSync(downloadedFFmpeg) || !existsSync(downloadedFFprobe)) {
-                    this.logger.info("System ffmpeg/ffprobe not found. Downloading...");
-                    const success = await this.downloadAndExtractFFmpeg();
-                    if (!success) {
-                        this.logger.error("Failed to download FFmpeg binaries and system ffmpeg not available.");
-                        return "missing_ffmpeg";
-                    }
+            if (!this.findWorkingBinary("ffmpeg") || !this.findWorkingBinary("ffprobe")) {
+                this.logger.info("No working FFmpeg/FFprobe pair found. Downloading portable binaries...");
+                const success = await this.downloadAndExtractFFmpeg();
+                if (!success || !this.findWorkingBinary("ffmpeg") || !this.findWorkingBinary("ffprobe")) {
+                    this.logger.error("Failed to prepare working FFmpeg/FFprobe binaries.");
+                    return "missing_ffmpeg";
                 }
             }
 

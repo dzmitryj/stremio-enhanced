@@ -4,6 +4,32 @@ import PlaybackState from "./PlaybackState";
 
 const logger = getLogger("EmbeddedSubtitles");
 
+function getMediaMaxWidth(mediaURL: string): number | null {
+    const heightMatch = decodeURIComponent(mediaURL).match(/(?:^|[^0-9])([1-9][0-9]{2,3})p(?:[^0-9]|$)/i);
+    if (!heightMatch) return null;
+
+    const height = Number(heightMatch[1]);
+    if (!Number.isFinite(height)) return null;
+
+    return Math.ceil(height * 16 / 9);
+}
+
+function getSupportedVideoCodecs(): string[] {
+    const video = document.createElement("video");
+    const codecTests: { codec: string; mimeTypes: string[] }[] = [
+        { codec: "h264", mimeTypes: ['video/mp4; codecs="avc1.42E01E"'] },
+        { codec: "h265", mimeTypes: ['video/mp4; codecs="hvc1.1.6.L93.B0"', 'video/mp4; codecs="hev1.1.6.L93.B0"'] },
+        { codec: "hevc", mimeTypes: ['video/mp4; codecs="hvc1.1.6.L93.B0"', 'video/mp4; codecs="hev1.1.6.L93.B0"'] },
+        { codec: "vp9", mimeTypes: ['video/webm; codecs="vp09.00.10.08"', 'video/mp4; codecs="vp09.00.10.08"'] },
+        { codec: "av1", mimeTypes: ['video/mp4; codecs="av01.0.08M.08"', 'video/webm; codecs="av01.0.08M.08"'] },
+        { codec: "av01", mimeTypes: ['video/mp4; codecs="av01.0.08M.08"', 'video/webm; codecs="av01.0.08M.08"'] },
+    ];
+
+    return codecTests
+        .filter(({ mimeTypes }) => mimeTypes.some(mimeType => video.canPlayType(mimeType) !== ""))
+        .map(({ codec }) => codec);
+}
+
 class EmbeddedSubtitles {
     private static extractedAlready = false;
 
@@ -67,7 +93,9 @@ class EmbeddedSubtitles {
         const queryParams = new URLSearchParams();
         queryParams.append("mediaURL", streamURL);
         queryParams.append("maxAudioChannels", "2");
-        ['h264', 'h265', 'hevc', 'vp9'].forEach(c => queryParams.append('videoCodecs', c));
+        const maxWidth = getMediaMaxWidth(streamURL);
+        if (maxWidth) queryParams.append("maxWidth", String(maxWidth));
+        getSupportedVideoCodecs().forEach(c => queryParams.append('videoCodecs', c));
         ['aac', 'mp3', 'opus'].forEach(c => queryParams.append('audioCodecs', c));
 
         const masterUrl = streamURL.includes('.m3u8') 
